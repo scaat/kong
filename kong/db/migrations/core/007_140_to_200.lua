@@ -21,8 +21,8 @@ local pg_path_handling_sql do
   end
   table.sort(v0_conds)
   table.sort(v1_conds)
-  v0_conds = table.concat(v0_conds, "\n      OR ")
-  v1_conds = table.concat(v1_conds, "\n         OR ")
+  v0_conds = table.concat(v0_conds, "\n        OR ")
+  v1_conds = table.concat(v1_conds, "\n           OR ")
 
   pg_path_handling_sql = fmt([[
     DO $$
@@ -35,16 +35,34 @@ local pg_path_handling_sql do
 
     DO $$
     DECLARE
+      preset_path_handling TEXT;
       migrating_from TEXT;
     BEGIN
-      SELECT last_executed INTO migrating_from FROM schema_meta WHERE subsystem = 'core';
-      IF %s
+      SELECT last_executed INTO preset_path_handling FROM schema_meta
+        WHERE key = '007_140_to_200' AND subsystem = 'path_handling';
+
+      IF preset_path_handling IS NULL
       THEN
-        UPDATE routes SET path_handling = 'v0';
-      ELSIF %s
-      THEN
-        UPDATE routes SET path_handling = 'v1';
+
+        SELECT last_executed INTO migrating_from FROM schema_meta
+          WHERE key = 'schema_meta' AND subsystem = 'core';
+
+        IF %s
+        THEN
+          preset_path_handling := 'v0';
+        ELSIF %s
+        THEN
+          preset_path_handling := 'v1';
+        ELSE
+          RETURN;
+        END IF;
+
       END IF;
+
+      INSERT INTO schema_meta (key, subsystem, last_executed)
+        VALUES('007_140_to_200', 'path_handling', preset_path_handling);
+
+      UPDATE routes SET path_handling = preset_path_handling;
     END;
     $$;
   ]], v0_conds, v1_conds)
@@ -77,35 +95,60 @@ return {
 
   cassandra = {
     up = function(connector)
-      local res, err = connector:query([[
-        ALTER TABLE routes ADD path_handling text;
-      ]])
-
+      local cql = "ALTER TABLE routes ADD path_handling text";
+      local res, err = connector:query(cql);
       if not res then
         if connector:is_ignorable_during_migrations(err) then
           ngx.log(ngx.WARN, fmt(
             "ignored error while running '007_140_to_200' migration: %s (%s)",
-            err, "ALTER TABLE routes ADD path_handling text;"
+            err, cql
           ))
         else
-          return nil, err
+          error(err)
         end
       end
 
       local rows = assert(connector:query([[
         SELECT last_executed FROM schema_meta
-        WHERE key = 'schema_meta' AND subsystem = 'core';
-      ]]))
-      local migrating_from = rows and rows[1] and rows[1].last_executed
-      local path_handling = PATH_HANDLING_WHEN_MIGRATING_FROM[migrating_from]
-      if path_handling then
+          WHERE key = ? AND subsystem = ?;
+      ]], {
+        cassandra.text("007_140_to_200"),
+        cassandra.text("path_handling"),
+      }))
+      local preset_path_handling = rows and rows[1] and rows[1].last_executed
+
+      if not preset_path_handling then
+        local rows = assert(connector:query([[
+          SELECT last_executed FROM schema_meta
+            WHERE key = ? AND subsystem = ?;
+        ]], {
+          cassandra.text("schema_meta"),
+          cassandra.text("core"),
+        }))
+        local migrating_from = rows and rows[1] and rows[1].last_executed
+
+        if migrating_from then
+          preset_path_handling = PATH_HANDLING_WHEN_MIGRATING_FROM[migrating_from]
+        end
+      end
+
+      if preset_path_handling then
+        assert(connector:query([[
+          INSERT INTO schema_meta (key, subsystem, last_executed)
+            VALUES(?, ?, ?);
+        ]], {
+          cassandra.text("007_140_to_200"),
+          cassandra.text("path_handling"),
+          cassandra.text(preset_path_handling)
+        }))
+
         local rows = assert(connector:query([[
           SELECT id FROM routes;
         ]]))
         for i = 1, #rows do
           assert(connector:query(
             "UPDATE routes SET path_handling = ? WHERE id = ?;",
-            { cassandra.text(path_handling),
+            { cassandra.text(preset_path_handling),
               cassandra.text(rows[i].id)
             }
           ))
@@ -117,7 +160,6 @@ return {
       assert(connector:query([[
         DROP INDEX IF EXISTS plugins_run_on_idx;
         ALTER TABLE plugins DROP run_on;
-
 
         DROP TABLE IF EXISTS cluster_ca;
       ]]))
